@@ -237,6 +237,7 @@ class MPCThresholdContext {
 class ZKProofService extends EventEmitter {
   /**
    * Initialize the service with a specific number of workers.
+   */
   constructor(workerCount = CPU_CONCURRENCY, options = {}) {
     super();
     this.workerCount = workerCount;
@@ -248,6 +249,10 @@ class ZKProofService extends EventEmitter {
     this.asyncJobs = new Map();
     this.proofCache = options.proofCache ?? new ProofCache({ redisUrl: options.redisUrl ?? process.env.REDIS_URL });
     this.inFlightProofs = new Map();
+    // Ceremony artifact entries to verify on initialize().
+    // Each entry: { file: string, expectedSha256: string }
+    // Inject via options.zkeyAuditEntries (or leave empty to skip, e.g. in tests).
+    this.zkeyAuditEntries = options.zkeyAuditEntries ?? null;
     this.proverQueue = new ProverJobQueue({
       redisUrl: options.redisUrl ?? process.env.REDIS_URL,
       concurrency: CPU_CONCURRENCY,
@@ -294,14 +299,34 @@ class ZKProofService extends EventEmitter {
     });
   }
 
-  initialize() {
-    this.workers = Array.from({ length: this.workerCount }, (_, id) => ({ id, status: 'idle' }));
+  async initialize() {
+    // ── Trusted Setup Gate ───────────────────────────────────────────────────
+    // Verify zkey / Powers-of-Tau artifact integrity before the worker pool
+    // is started and before any proof request can be accepted.
+    // Pass options.zkeyAuditEntries when constructing to enable this check.
+    // Startup is aborted with a thrown Error if any file is missing or its
+    // SHA-256 checksum does not match the expected ceremony value.
+    if (this.zkeyAuditEntries && this.zkeyAuditEntries.length > 0) {
+      await auditZkeyChecksums(this.zkeyAuditEntries);
+    }
     this.isReady = true;
     this.startedAt = Date.now();
     this.workers = [];
     for (let i = 0; i < this.workerCount; i++) {
       this._spawnWorker(i);
     }
+  }
+
+  /**
+   * Acquire an idle worker entry for a proof job, marking it active.
+   * Returns null when the pool is at capacity.
+   * @returns {{ id: number, status: string, worker: Worker, job: object|null } | null}
+   */
+  _acquireWorker() {
+    const entry = this.workers.find((candidate) => candidate.status === 'idle');
+    if (!entry) return null;
+    entry.status = 'active';
+    return entry;
   }
 
   _spawnWorker(id) {
@@ -363,6 +388,32 @@ class ZKProofService extends EventEmitter {
   }
 
   /**
+   * Load-balance across the worker pool (Issue #791): picks the first idle
+   * worker entry and marks it active before dispatching a job to it.
+   *
+   * This method was called from `generateProof()` but was never defined —
+   * every `/generate-proof` request threw `this._acquireWorker is not a
+   * function` at runtime, meaning the worker pool below (which is otherwise
+   * fully implemented: spawn, crash-replace, timeout, memory limits) could
+   * never actually be reached.
+   * Load-balance across the worker pool: picks the first idle worker entry
+   * and marks it active before dispatching a job to it.
+   *
+   * This method was called from `generateProof()` but was never defined —
+   * every `/generate-proof` request threw `this._acquireWorker is not a
+   * function` at runtime, meaning the worker pool below (spawn,
+   * crash-replace, timeout, memory limits) could never actually be reached.
+   *
+   * @returns {{id: number, status: string, worker: import('worker_threads').Worker, job: object|null}|null}
+   */
+  _acquireWorker() {
+    const entry = this.workers.find((candidate) => candidate.status === 'idle');
+    if (!entry) return null;
+    entry.status = 'active';
+    return entry;
+  }
+
+  /**
    * @param {{ id: number }} worker
    */
   _releaseWorker(worker) {
@@ -416,12 +467,6 @@ class ZKProofService extends EventEmitter {
       })
       .catch(() => {});
     return proofPromise;
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      return { proofId: crypto.randomUUID(), pi_a: ['0x1', '0x2'], pi_b: [['0x3', '0x4'], ['0x5', '0x6']], pi_c: ['0x7', '0x8'], publicSignals: ['0x9'] };
-    } finally {
-      worker.status = 'idle';
-    }
   }
 
   async verifyProof({ taskCondition, proof, conditionHash, circuitId }) {
@@ -475,49 +520,21 @@ class ZKProofService extends EventEmitter {
 
     this.asyncJobs.set(jobId, job);
 
-    // Asynchronously process proof generation within an ephemeral directory
-    setImmediate(async () => {
-      try {
-        job.status = 'processing';
-        job.progress = 25;
-        this.emit('jobProgress', { jobId, status: job.status, progress: job.progress });
-
-        // Use ephemeral directory for proof generation to ensure temp files are cleaned up
-        await withEphemeralDir(async (ephemeralDir) => {
-          await writeFile(ephemeralDir, 'witness.json', JSON.stringify(clientData));
-          await writeFile(ephemeralDir, 'taskCondition.json', JSON.stringify(taskCondition));
-
-          job.progress = 50;
-          this.emit('jobProgress', { jobId, status: job.status, progress: job.progress });
-
-          const rawProof = await this.generateProof(taskCondition, clientData);
-          const conditionHash = hashTaskCondition(taskCondition);
-
-          job.progress = 100;
-          job.status = 'completed';
-          job.result = {
-            proofId: rawProof.proofId,
-            status: 'success',
-            conditionHash,
-            proof: {
-              pi_a: rawProof.pi_a,
-              pi_b: rawProof.pi_b,
-              pi_c: rawProof.pi_c,
-              publicSignals: rawProof.publicSignals,
-            },
-            generatedAt: new Date().toISOString(),
-          };
-        });
-
-        this.emit('jobComplete', job);
-      } catch (err) {
-        job.status = 'failed';
-        job.error = err.message;
-        this.emit('jobError', job);
-      }
-    this.proverQueue.add(jobId, { taskCondition, clientData, circuitId, circuitArtifactHash }).catch((error) => {
-      this.proverQueue.onError(jobId, error);
-    });
+    // Process the job through the prover queue (BullMQ when Redis is
+    // configured, in-process worker pool otherwise). Progress and completion
+    // are surfaced via the jobProgress / jobComplete / jobError events that
+    // the SSE stream endpoint subscribes to. No inline processing here so each
+    // job is generated exactly once.
+    this.proverQueue
+      .add(jobId, { taskCondition, clientData, circuitId, circuitArtifactHash })
+      .catch((error) => {
+        const failed = this.asyncJobs.get(jobId);
+        if (failed) {
+          failed.status = 'failed';
+          failed.error = error.message;
+          this.emit('jobError', failed);
+        }
+      });
 
     return {
       jobId,
@@ -556,4 +573,4 @@ class ZKProofService extends EventEmitter {
   }
 }
 
-module.exports = { ZKProofService };
+module.exports = { ZKProofService, auditZkeyChecksums, computeFileSha256 };
