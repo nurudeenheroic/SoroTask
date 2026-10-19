@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, Env, Symbol, Val, Vec};
 
@@ -13,12 +15,14 @@ fn create_sample_task_config(env: &Env, creator: &Address, target: &Address) -> 
         resolver: None,
         interval: 3600,
         last_run: 0,
-        gas_balance: 10_000_000,
+        gas_balance: 0, // Set to 0 to avoid requiring token transfer at registration
         whitelist: vec![env],
         is_active: true,
         blocked_by: vec![env],
         yield_strategy: None,
         permissions: 0,
+        expiration_timestamp: 0,
+        max_runs: 0,
     }
 }
 
@@ -42,7 +46,7 @@ fn test_register_and_get_task() {
     assert_eq!(retrieved_config.creator, creator);
     assert_eq!(retrieved_config.target, target);
     assert_eq!(retrieved_config.interval, 3600);
-    assert_eq!(retrieved_config.gas_balance, 10_000_000);
+    assert_eq!(retrieved_config.gas_balance, 0);
 }
 
 #[test]
@@ -90,7 +94,8 @@ fn test_bounty_inflation_protection() {
 
     let creator = Address::generate(&env);
     let target = Address::generate(&env);
-    let task_config = create_sample_task_config(&env, &creator, &target);
+    let mut task_config = create_sample_task_config(&env, &creator, &target);
+    task_config.gas_balance = 10_000_000;
 
     let task_id = client.register(&task_config);
 
@@ -101,6 +106,88 @@ fn test_bounty_inflation_protection() {
     // Escrow check with 10M balance should be healthy
     let is_healthy = client.check_bounty_escrow_health(&task_id, &500);
     assert!(is_healthy);
+}
+
+#[test]
+fn test_reentrancy_guard_transient_storage() {
+    let env = Env::default();
+    let contract_id = env.register(SoroTaskContract, ());
+    env.as_contract(&contract_id, || {
+        enter_security_guard(&env);
+
+        // Immediate second enter should panic with ReentrantCall (code 300)
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enter_security_guard(&env);
+        }));
+        assert!(res.is_err());
+
+        exit_security_guard(&env);
+        // After exit, entering again should succeed
+        enter_security_guard(&env);
+        exit_security_guard(&env);
+    });
+}
+
+#[test]
+fn test_flash_swap_slippage_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(SoroTaskContract, ());
+    let client = SoroTaskContractClient::new(&env, &contract_id);
+
+    let keeper = Address::generate(&env);
+    let target = Address::generate(&env);
+    let router = Address::generate(&env);
+    let token_borrow = Address::generate(&env);
+    let token_repay = Address::generate(&env);
+
+    let config = TaskConfig {
+        creator: keeper.clone(),
+        target: target.clone(),
+        function: Symbol::new(&env, "hello"),
+        args: vec![&env],
+        resolver: None,
+        interval: 3600,
+        last_run: 0,
+        gas_balance: 0, // Set to 0 to avoid requiring token transfer at registration
+        whitelist: Vec::new(&env),
+        is_active: true,
+        blocked_by: Vec::new(&env),
+        yield_strategy: None,
+        permissions: 15,
+        expiration_timestamp: 0,
+        max_runs: 0,
+    };
+
+    let task_id = client.register(&config);
+
+    // Slippage > 10_000 bps should panic with InvalidSlippage
+    let invalid_params = FlashSwapParams {
+        dex_router: router.clone(),
+        token_borrow: token_borrow.clone(),
+        amount_borrow: 10_000,
+        token_repay: token_repay.clone(),
+        min_profit: 50,
+        flash_fee_bps: 12_000, // Invalid: > 100%
+    };
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.execute_flash_swap_arbitrage(&keeper, &task_id, &invalid_params);
+    }));
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_normalized_error_discriminants() {
+    assert_eq!(Error::InvalidInterval as u32, 1);
+    assert_eq!(Error::Unauthorized as u32, 2);
+    assert_eq!(Error::InsufficientBalance as u32, 3);
+    assert_eq!(Error::NotInitialized as u32, 4);
+    assert_eq!(Error::TaskPaused as u32, 5);
+    assert_eq!(Error::TaskAlreadyPaused as u32, 6);
+    assert_eq!(Error::TaskAlreadyActive as u32, 7);
+    assert_eq!(Error::SelfDependency as u32, 8);
 }
 
 #[test]
@@ -133,4 +220,3 @@ fn test_oracle_volatility_circuit_breaker() {
     let res = client.try_check_oracle_volatility(&121_000);
     assert!(res.is_err());
 }
-
